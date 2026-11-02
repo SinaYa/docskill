@@ -1,0 +1,207 @@
+#!/bin/sh
+# refresh: compare a project's copy of the system with docskill. Only reads unless given --apply or --keep.
+# Procedure and what each state means: method/refresh-a-copy-of-the-system.md.
+#   refresh <project> [--apply] [--only <file>]... [--mark] [--keep <file>]...
+export GIT_OPTIONAL_LOCKS=0
+apply=
+mark=
+project=
+only=
+keep=
+expect=
+for arg in "$@"; do
+	case $expect in
+	only) only="$only
+$arg"; expect=; continue ;;
+	keep) keep="$keep
+$arg"; expect=; continue ;;
+	esac
+	case $arg in
+	--apply) apply=1 ;;
+	--mark) mark=1 ;;
+	--only) expect=only ;;
+	--keep) expect=keep ;;
+	*) project=$arg ;;
+	esac
+done
+[ -n "$project" ] || { echo "usage: refresh <project> [--apply] [--only <file>]... [--mark] [--keep <file>]..." >&2; exit 2; }
+root=$(cd "$project" 2>/dev/null && pwd) || { echo "no such folder: $project" >&2; exit 2; }
+here=$(cd "$(dirname "$0")/.." && pwd)
+marker=$root/docs/.system-source
+kept=$root/docs/.system-keep
+
+if [ -n "$keep" ]; then
+	printf '%s\n' "$keep" | grep . >> "$kept"
+	sort -u "$kept" -o "$kept"
+fi
+
+latest=$(git -C "$here" rev-parse HEAD) || exit 2
+marked=1
+if [ -f "$marker" ]; then
+	rev=$(tr -d '\r\n ' < "$marker")
+	git -C "$here" cat-file -e "$rev^{commit}" 2> /dev/null || { echo "docskill has no commit $rev" >&2; exit 2; }
+else
+	marked=
+	if [ -n "$apply" ] && [ -z "$mark" ]; then
+		echo "no docs/.system-source, so --apply refuses. --apply --mark takes what's missing and marks the copy" >&2
+		exit 2
+	fi
+	rev=$latest
+	echo "note: no docs/.system-source; comparing with the latest, so any difference shows as local-change"
+fi
+
+tmp=$(mktemp -d) || exit 2
+trap 'rm -rf "$tmp"' EXIT
+. "$here/scripts/lib-rules"
+list() { git -C "$here" -c core.quotepath=false ls-tree -r --name-only "$1" -- system modules; }
+list "$rev" > "$tmp/marked"
+list "$latest" > "$tmp/newest"
+sort -u "$tmp/marked" "$tmp/newest" > "$tmp/shared"
+
+# Where a shared file lands in a project. Prints nothing for a seed: a file the project fills in.
+landing() {
+	case $1 in
+	system/*) rel=${1#system/} ;;
+	modules/*) rest=${1#modules/}; rel=${rest#*/} ;;
+	esac
+	case $rel in
+	docs/user-quotes/order.md | docs/project/open-decisions-for-the-user.md | docs/project/choices-this-project-made.md) ;;
+	layout-when-docs-are-tracked.md) ;;
+	*) printf '%s\n' "$rel" ;;
+	esac
+}
+
+# A module counts as installed when any of its files is in the project.
+: > "$tmp/installed"
+while IFS= read -r src; do
+	case $src in
+	modules/*)
+		rest=${src#modules/}
+		[ -e "$root/${rest#*/}" ] && printf '%s\n' "${rest%%/*}" >> "$tmp/installed"
+		;;
+	esac
+done < "$tmp/shared"
+
+# Left out on purpose: in the marked commit, in an installed part, and absent. New files are offered.
+: > "$tmp/out"
+if [ -n "$marked" ]; then
+	while IFS= read -r src; do
+		case $src in
+		modules/*)
+			rest=${src#modules/}
+			grep -qx "${rest%%/*}" "$tmp/installed" || continue
+			;;
+		esac
+		rel=$(landing "$src")
+		[ -n "$rel" ] && [ ! -e "$root/$rel" ] && printf '%s\n' "$rel" >> "$tmp/out"
+	done < "$tmp/marked"
+fi
+
+# The copy equals this project's rendering of that version, line ends aside.
+same() { # same <rev> <src> <landing> <file>
+	# The usual case: nothing left out, and the same bytes.
+	if [ ! -s "$tmp/out" ] && cmp -s "$(tree_of "$1")/$2" "$4"; then
+		return 0
+	fi
+	specs_missing_from "$3" "$4" > "$tmp/specs"
+	render "$1" "$2" "$3" "$tmp/specs" "$tmp/out" > "$tmp/a"
+	tr -d '\r' < "$4" > "$tmp/b"
+	cmp -s "$tmp/a" "$tmp/b"
+}
+
+: > "$tmp/report"
+: > "$tmp/landed"
+left=0
+while IFS= read -r src; do
+	case $src in
+	modules/*)
+		rest=${src#modules/}
+		grep -qx "${rest%%/*}" "$tmp/installed" || continue
+		;;
+	esac
+	rel=$(landing "$src")
+	[ -n "$rel" ] || continue
+	printf '%s\n' "$rel" >> "$tmp/landed"
+	file=$root/$rel
+	in_marked=
+	newest=
+	grep -qxF "$src" "$tmp/marked" && in_marked=1
+	grep -qxF "$src" "$tmp/newest" && newest=1
+	if [ ! -e "$file" ]; then
+		[ -n "$newest" ] && state=missing || state=
+		# A module's script comes only with bootstrap --scripts.
+		case $src in
+		modules/*/docs/*) ;;
+		modules/*) state= ;;
+		esac
+		# In the marked commit and absent: left out on purpose, so not offered again.
+		if [ -n "$marked" ] && [ -n "$in_marked" ] && [ -n "$state" ]; then
+			state=left-out
+		fi
+	elif [ -f "$kept" ] && grep -qxF "$rel" "$kept"; then
+		state=kept
+	elif [ -n "$newest" ] && same "$latest" "$src" "$rel" "$file"; then
+		state=current
+	elif [ -n "$in_marked" ] && [ -n "$marked" ] && same "$rev" "$src" "$rel" "$file"; then
+		[ -n "$newest" ] && state=stale || state=retired
+	else
+		state=local-change
+	fi
+	[ -n "$state" ] && printf '%s %s\t%s\n' "$state" "$rel" "$src" >> "$tmp/report"
+done < "$tmp/shared"
+
+# The project's own files in the folders the system owns.
+sort -u "$tmp/landed" > "$tmp/landed-sorted"
+(
+	cd "$root" || exit
+	for folder in docs/rules/docs-and-wording docs/rules/working-with-the-user docs/rules/tooling; do
+		[ -d "$folder" ] && find "$folder" -type f
+	done
+	[ -d docs/rules ] && find docs/rules -maxdepth 1 -type f
+) | sort > "$tmp/in-shared-folders"
+comm -23 "$tmp/in-shared-folders" "$tmp/landed-sorted" | while IFS= read -r rel; do
+	printf 'local-only %s\t\n' "$rel" >> "$tmp/report"
+done
+
+for state in stale missing retired local-change local-only; do
+	grep "^$state " "$tmp/report" | cut -f1
+done
+summary=
+for state in current stale missing retired local-change local-only kept left-out; do
+	summary="$summary$state=$(grep -c "^$state " "$tmp/report") "
+done
+echo "$summary"
+
+if [ -n "$apply" ]; then
+	printf '%s\n' "$only" | grep . > "$tmp/only"
+	while IFS="$(printf '\t')" read -r line src; do
+		state=${line%% *}
+		rel=${line#* }
+		if [ -s "$tmp/only" ]; then
+			grep -qxF "$rel" "$tmp/only" || continue
+			case $state in stale | missing | local-change | left-out) ;; *) continue ;; esac
+		fi
+		case $state in
+		stale | missing | local-change | left-out)
+			case $state in
+			local-change | left-out) [ -s "$tmp/only" ] || continue ;;
+			esac
+			mkdir -p "$root/$(dirname "$rel")"
+			if [ -e "$root/$rel" ]; then
+				specs_missing_from "$rel" "$root/$rel" > "$tmp/specs"
+			else
+				: > "$tmp/specs"
+			fi
+			render "$latest" "$src" "$rel" "$tmp/specs" "$tmp/out" > "$tmp/new"
+			cp "$tmp/new" "$root/$rel"
+			;;
+		retired) rm -f "$root/$rel" ;;
+		esac
+	done < "$tmp/report"
+	if [ -s "$tmp/only" ]; then
+		echo "applied those files; the marker stays, so the rest still show. Nothing is committed."
+	else
+		printf '%s\n' "$latest" > "$marker"
+		echo "applied; marker moved to $latest. Nothing is committed."
+	fi
+fi

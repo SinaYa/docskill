@@ -1,0 +1,32 @@
+# What can stay out of a project's copy, so a rule decided against isn't there for anyone to read.
+# Fields, tab-separated: key, file as it lands, kind, anchor, end, replacement, the anchor's old wording.
+# file: the whole file. block: from the line starting with anchor up to the line starting with end
+# (empty end: through the next blank line; EOF: to the end). phrase: the exact text. swap: a block
+# replaced by a file in this repository.
+infinite-session	docs/AUTHORITY.md	block	## Infinite session	
+infinite-session	docs/AUTHORITY.md	block	When your context reaches 70%,	
+tests	docs/AUTHORITY.md	block	## Tests	## Third-party reference code
+tests	docs/AUTHORITY.md	phrase	 Where any other file requires, suggests, or assumes tests, this file wins.
+reference-code	docs/AUTHORITY.md	block	## Third-party reference code	EOF		## Proprietary reference code
+batons	docs/DOCUMENTATION_SYSTEM.md	block	- **Baton**	- **Rules**
+batons	docs/reading-order.md	block	4. `docs/batons/`	5. `docs/rules/`
+batons	docs/rules/docs-and-wording/a-new-baton-replaces-the-old-one-and-a-new-chat-reads-the-latest.md	file
+user-quotes	docs/DOCUMENTATION_SYSTEM.md	block	- **User quotes**
+user-quotes	docs/reading-order.md	block	2. `docs/user-quotes/`	3. `docs/handoff/`
+user-quotes	docs/user-quotes/order.md	file
+plan	docs/DOCUMENTATION_SYSTEM.md	block	- **Plan**	- **Project**
+reports	docs/DOCUMENTATION_SYSTEM.md	block	- **Reports**	- **User quotes**
+small	docs/DOCUMENTATION_SYSTEM.md	block	**Small.**
+one-fact	docs/DOCUMENTATION_SYSTEM.md	block	**One fact, one file.**
+numbering	docs/DOCUMENTATION_SYSTEM.md	block	**No numbering**
+dates-and-counts	docs/DOCUMENTATION_SYSTEM.md	block	**No counts or dates
+update-or-delete	docs/DOCUMENTATION_SYSTEM.md	block	**Update or delete;
+worklogs	docs/DOCUMENTATION_SYSTEM.md	block	**No worklogs.**
+style	docs/DOCUMENTATION_SYSTEM.md	block	**Style.**
+no-index	docs/DOCUMENTATION_SYSTEM.md	phrase	 Keep no index files that list other files.
+tracked	docs/DOCUMENTATION_SYSTEM.md	swap	**Layout.** All documentation lives in	**Kinds of file.**	modules/tracked-docs/layout-when-docs-are-tracked.md
+tracked	docs/DOCUMENTATION_SYSTEM.md	block	**Bootstrapping a project onto this system.**	EOF
+tracked	.githooks/post-commit	file
+tracked	docs/architecture/git-hooks-and-the-docs-repository-pairing.md	file
+read-documentation-several-files-at-a-time-to-save-turns	docs/rules/read-documentation-several-files-at-a-time-to-save-turns.md	file
+read-documentation-several-files-at-a-time-to-save-turns	docs/reading-order.md	block	Read several files at a time:	

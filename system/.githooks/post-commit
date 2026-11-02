@@ -1,0 +1,17 @@
+#!/bin/sh
+# post-commit: if docs/ is a repository of its own with changes, commit them there,
+# citing this commit. Does nothing where docs/ is absent or unchanged.
+root=$(git rev-parse --show-toplevel) || exit 0
+[ -d "$root/docs/.git" ] || exit 0
+name=$(basename "$root" | tr '[:upper:] ' '[:lower:]-')
+hash=$(git rev-parse --short HEAD)
+full=$(git rev-parse HEAD)
+subject=$(git log -1 --format=%s HEAD)
+# A hook inherits GIT_DIR, GIT_INDEX_FILE and friends from the commit that ran
+# it; left set, every command below would act on the project repository.
+unset $(git rev-parse --local-env-vars)
+cd "$root/docs" || exit 0
+[ -n "$(git status --porcelain)" ] || exit 0
+git add --all . && git commit -q -m "$name $hash: $subject" -m "Docs changed alongside project commit $full." \
+	|| echo "post-commit: docs/ has changes that could not be committed; commit them in docs/ by hand." >&2
+exit 0

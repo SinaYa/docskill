@@ -1,0 +1,122 @@
+# lib-rules: how bootstrap and refresh render a shared file for a project that left rules out.
+# Sourced; needs $here (the repository) and $tmp. A copy holds no list of what was left out: a text
+# part left out is an anchor missing from the copy, and a whole file is one missing from the project.
+parts=$here/scripts/rule-parts
+
+# A commit's shared files, extracted once: one git process per file is slow on Windows.
+tree_of() { # tree_of <rev>
+	t=$tmp/tree-$1
+	if [ ! -d "$t" ]; then
+		mkdir -p "$t"
+		git -C "$here" archive "$1" -- system modules | tar -x -C "$t"
+	fi
+	printf '%s\n' "$t"
+}
+
+# Rule-parts entries that touch part of a file, so most files can skip all this.
+grep -v '^#' "$parts" | awk -F '\t' '$3 != "file" { print $2 }' | sort -u > "$tmp/parted"
+
+# Lines of rule-parts for one landed file, whole-file entries aside.
+specs_of() { # specs_of <landing>
+	grep -v '^#' "$parts" | awk -F '\t' -v f="$1" '$2 == f && $3 != "file"'
+}
+
+# The parts of this landed file that the given copy no longer holds.
+specs_missing_from() { # specs_missing_from <landing> <copy>
+	grep -qxF -- "$1" "$tmp/parted" || return 0
+	specs_of "$1" | while IFS= read -r spec; do
+		anchor=$(printf '%s\n' "$spec" | cut -f4)
+		grep -qF -- "$anchor" "$2" && continue
+		# A copy older than a rewording still holds the part, under its old wording.
+		old=$(printf '%s\n' "$spec" | cut -f7)
+		[ -n "$old" ] && grep -qF -- "$old" "$2" && continue
+		printf '%s\n' "$spec"
+	done
+}
+
+# stdin to stdout, with those parts taken out. Replacements come from the given commit.
+take_out() { # take_out <specs-file> <rev>
+	cp /dev/stdin "$tmp/taking"
+	while IFS= read -r spec; do
+		[ -n "$spec" ] || continue
+		kind=$(printf '%s\n' "$spec" | cut -f3)
+		A=$(printf '%s\n' "$spec" | cut -f4)
+		E=$(printf '%s\n' "$spec" | cut -f5)
+		R=
+		[ "$kind" = swap ] && R=$(printf '%s\n' "$spec" | cut -f6)
+		: > "$tmp/swapped"
+		[ -n "$R" ] && cat "$(tree_of "$2")/$R" > "$tmp/swapped" 2> /dev/null
+		case $kind in
+		phrase)
+			A=$A awk 'BEGIN { a = ENVIRON["A"] }
+				{ if ((i = index($0, a)) > 0) $0 = substr($0, 1, i - 1) substr($0, i + length(a)); print }' \
+				"$tmp/taking" > "$tmp/taken"
+			;;
+		*)
+			A=$A E=$E SWAP=$tmp/swapped awk 'BEGIN { a = ENVIRON["A"]; e = ENVIRON["E"]; swap = ENVIRON["SWAP"] }
+				!skip && index($0, a) == 1 {
+					skip = 1
+					while ((getline line < swap) > 0) print line
+					next
+				}
+				skip {
+					if (e == "EOF") next
+					if (e == "") { if ($0 ~ /^\r?$/) skip = 0; next }
+					if (index($0, e) == 1) skip = 0; else next
+				}
+				{ print }' "$tmp/taking" > "$tmp/taken"
+			;;
+		esac
+		mv "$tmp/taken" "$tmp/taking"
+	done < "$1"
+	cat "$tmp/taking"
+}
+
+# stdin to stdout: a link to a file left out becomes its text, so nothing dangles.
+delink() { # delink <landing> <left-out-list>
+	F=$1 OUT=$2 awk '
+		function norm(p, n, a, i, k, o, s) {
+			n = split(p, a, "/"); k = 0
+			for (i = 1; i <= n; i++) {
+				if (a[i] == "." || a[i] == "") continue
+				if (a[i] == "..") { k--; continue }
+				o[++k] = a[i]
+			}
+			s = ""
+			for (i = 1; i <= k; i++) s = s (i > 1 ? "/" : "") o[i]
+			return s
+		}
+		BEGIN {
+			f = ENVIRON["F"]; dir = f
+			if (!sub(/\/[^\/]*$/, "", dir)) dir = "."
+			while ((getline line < ENVIRON["OUT"]) > 0) out[line] = 1
+		}
+		/^(~~~|```)/ { fenced = !fenced }
+		fenced { print; next }
+		{
+			line = $0; res = ""
+			while (match(line, /\[[^]]*\]\([^) ]+\)/)) {
+				m = substr(line, RSTART, RLENGTH)
+				i = index(m, "](")
+				text = substr(m, 2, i - 2)
+				link = substr(m, i + 2, length(m) - i - 2)
+				sub(/#.*/, "", link)
+				res = res substr(line, 1, RSTART - 1) ((norm(dir "/" link) in out) ? text : m)
+				line = substr(line, RSTART + RLENGTH)
+			}
+			print res line
+		}'
+}
+
+# A shared file as this project should hold it.
+render() { # render <rev> <src> <landing> <specs-file> <left-out-list>
+	src_file=$(tree_of "$1")/$2
+	[ -f "$src_file" ] || return 0
+	if [ ! -s "$4" ] && [ ! -s "$5" ]; then
+		cat "$src_file"
+	elif [ ! -s "$4" ]; then
+		delink "$3" "$5" < "$src_file"
+	else
+		take_out "$4" "$1" < "$src_file" | delink "$3" "$5"
+	fi
+}

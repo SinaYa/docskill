@@ -1,0 +1,292 @@
+#!/bin/sh
+# bootstrap: put a project on the documentation system, from docskill's latest commit.
+#   bootstrap <project> [--commit] [--scripts] [--tracked] [--no-hook] [--infinite-session] [--leave-out <rule>]... [module ...]
+# Without --commit nothing is committed in the project, and the next project commit pairs the marker
+# through the hook. With --commit the setup files are committed there and the pairing is confirmed.
+# A module's scripts land in the project's tracked code, so they come only with --scripts.
+# --tracked keeps the docs in the project's own repository, with no nested repository and no hook.
+# --no-hook keeps the nested repository, and its commits are made by hand.
+# --leave-out takes a rule decided against out of the copy: a key from scripts/rule-parts, or a file
+# as it lands, or its name. Nothing in the project records it.
+# --infinite-session keeps that rule in AUTHORITY.md. It's the one rule that goes in only when asked for.
+# Changes nothing if anything would be overwritten.
+export GIT_OPTIONAL_LOCKS=0
+commit=
+scripts=
+tracked=
+nohook=
+infinite=
+project=
+modules=
+wanted=
+expect=
+for arg in "$@"; do
+	if [ -n "$expect" ]; then
+		wanted="$wanted
+$arg"
+		expect=
+		continue
+	fi
+	case $arg in
+	--commit) commit=1 ;;
+	--scripts) scripts=1 ;;
+	--tracked) tracked=1 ;;
+	--no-hook) nohook=1 ;;
+	--infinite-session) infinite=1 ;;
+	--leave-out) expect=1 ;;
+	*)
+		if [ -z "$project" ]; then
+			project=$arg
+		else
+			modules="$modules $arg"
+		fi
+		;;
+	esac
+done
+[ -n "$project" ] || { echo "usage: bootstrap <project> [--commit] [--scripts] [--tracked] [--no-hook] [--infinite-session] [--leave-out <rule>]... [module ...]" >&2; exit 2; }
+[ -z "$expect" ] || { echo "--leave-out needs a rule" >&2; exit 2; }
+if [ -n "$infinite" ] && printf '%s\n' "$wanted" | grep -qx batons; then
+	echo "--infinite-session hands over through a baton, so it can't go with --leave-out batons" >&2
+	exit 2
+fi
+root=$(cd "$project" 2> /dev/null && pwd) || { echo "no such folder: $project" >&2; exit 2; }
+here=$(cd "$(dirname "$0")/.." && pwd)
+latest=$(git -C "$here" rev-parse HEAD) || exit 2
+
+tmp=$(mktemp -d) || exit 2
+trap 'rm -rf "$tmp"' EXIT
+. "$here/scripts/lib-rules"
+tree=$(tree_of "$latest")
+list() { git -C "$here" -c core.quotepath=false ls-tree -r --name-only "$latest" -- "$1"; }
+
+list system/ > "$tmp/files"
+for module in $modules; do
+	[ "$module" != tracked-docs ] || { echo "tracked docs come with --tracked, not as a module" >&2; exit 2; }
+	list "modules/$module/" > "$tmp/one"
+	[ -s "$tmp/one" ] || { echo "no such module: $module" >&2; exit 2; }
+	if [ -n "$scripts" ]; then
+		cat "$tmp/one" >> "$tmp/files"
+	else
+		grep "^modules/$module/docs/" "$tmp/one" >> "$tmp/files"
+	fi
+done
+
+landing() {
+	case $1 in
+	system/*) printf '%s\n' "${1#system/}" ;;
+	modules/*) rest=${1#modules/}; printf '%s\n' "${rest#*/}" ;;
+	esac
+}
+
+while IFS= read -r src; do
+	printf '%s\t%s\n' "$(landing "$src")" "$src"
+done < "$tmp/files" > "$tmp/landed"
+
+# What is decided out: keys, and whole files.
+[ -z "$tracked" ] || wanted="$wanted
+tracked"
+[ -n "$infinite" ] || wanted="$wanted
+infinite-session"
+: > "$tmp/keys"
+: > "$tmp/out"
+grep -v '^#' "$parts" | cut -f1 | sort -u > "$tmp/all-keys"
+printf '%s\n' "$wanted" | while IFS= read -r want; do
+	[ -n "$want" ] || continue
+	if grep -qxF -- "$want" "$tmp/all-keys"; then
+		printf '%s\n' "$want" >> "$tmp/keys"
+		grep -v '^#' "$parts" | awk -F '\t' -v k="$want" '$1 == k && $3 == "file" { print $2 }' >> "$tmp/out"
+	else
+		found=$(cut -f1 "$tmp/landed" | awk -v w="$want" '$0 == w || substr($0, length($0) - length(w)) == "/" w || substr($0, length($0) - length(w) - 3 + 0) == "/" w ".md"')
+		[ -n "$found" ] || { echo "no such rule to leave out: $want" >&2; echo nope > "$tmp/bad"; continue; }
+		printf '%s\n' "$found" >> "$tmp/out"
+	fi
+done
+[ ! -e "$tmp/bad" ] || exit 2
+
+# The user's words behind a rule left out go with it: those it links, unless a rule that stays links
+# them too, and those that name it.
+cut -f1 "$tmp/landed" | grep -vxFf "$tmp/out" > "$tmp/kept-before" || :
+grep -v '/the-users-words-behind-these-rules/' "$tmp/kept-before" | awk -F '\t' 'FILENAME == ARGV[1] { k[$0] = 1; next } ($1 in k) { print $2 }' - "$tmp/landed" > "$tmp/others"
+grep '/the-users-words-behind-these-rules/' "$tmp/landed" | cut -f2 > "$tmp/words"
+cp "$tmp/out" "$tmp/rules-out"
+while IFS= read -r rel; do
+	src=$(awk -F '\t' -v r="$rel" '$1 == r { print $2 }' "$tmp/landed")
+	[ -n "$src" ] && [ -f "$tree/$src" ] || continue
+	dir=${rel%/*}
+	grep -oE '\]\(([^)]*/)?the-users-words-behind-these-rules/[^)]*\)' "$tree/$src" | sed 's/^](//; s/)$//' | while IFS= read -r word; do
+		name=${word##*/}
+		(cd "$tree" && tr '\n' '\0' < "$tmp/others" | xargs -0 grep -lF -- "$name" > /dev/null 2>&1) \
+			|| printf '%s\n' "$dir/$word" | sed -E ':a; s#[^/]+/\.\./##; ta' >> "$tmp/out"
+	done
+	name=${rel##*/}
+	name=${name%.md}
+	[ -s "$tmp/words" ] || continue
+	(cd "$tree" && tr '\n' '\0' < "$tmp/words" | xargs -0 grep -lF -- "$name" 2> /dev/null) | while IFS= read -r word; do
+		landing "$word" >> "$tmp/out"
+	done
+done < "$tmp/rules-out"
+sort -u "$tmp/out" -o "$tmp/out"
+awk -F '\t' 'FILENAME == ARGV[1] { out[$0] = 1; next } !($1 in out)' "$tmp/out" "$tmp/landed" > "$tmp/keeping"
+
+# The text parts decided out, for each file they touch.
+grep -v '^#' "$parts" | awk -F '\t' 'FILENAME == ARGV[1] { k[$0] = 1; next } ($1 in k) && $3 != "file"' "$tmp/keys" - > "$tmp/out-specs"
+specs_for() { awk -F '\t' -v f="$1" '$2 == f' "$tmp/out-specs"; }
+
+# Check everything first.
+cdup=$(git -C "$root" rev-parse --show-cdup 2> /dev/null)
+if git -C "$root" rev-parse --git-dir > /dev/null 2>&1; then
+	[ -z "$cdup" ] || { echo "$root is inside another git repository; refusing" >&2; exit 2; }
+	hooks=$(git -C "$root" config core.hooksPath)
+	if [ -z "$tracked$nohook" ]; then
+		case $hooks in
+		'' | .githooks) ;;
+		*) echo "core.hooksPath is already $hooks; refusing. --no-hook keeps it, and docs are then committed by hand" >&2; exit 2 ;;
+		esac
+	fi
+	inited=
+else
+	inited=1
+fi
+# --commit commits the index, so it must hold nothing of the user's.
+if [ -n "$commit" ] && [ -z "$inited" ] && ! git -C "$root" diff --cached --quiet; then
+	echo "the index has staged changes, so nothing was changed. Commit them first, or drop --commit" >&2
+	exit 2
+fi
+# Git would stop halfway through the docs commit with no identity, after the files are written.
+git -C "$root" var GIT_COMMITTER_IDENT > /dev/null 2>&1 || {
+	echo "git has no identity here (user.name, user.email), so nothing was changed" >&2
+	exit 2
+}
+if [ -e "$root/docs" ] && [ -n "$(ls -A "$root/docs")" ]; then
+	echo "docs/ already has files. Keep them archived and move them aside first:" >&2
+	echo "method/adopt-a-project-that-already-has-docs.md" >&2
+	exit 2
+fi
+conflicts=
+while IFS= read -r rel; do
+	[ -e "$root/$rel" ] && conflicts="$conflicts
+  $rel"
+done <<EOF
+$(cut -f1 "$tmp/keeping")
+EOF
+[ -z "$conflicts" ] || { echo "would overwrite, so nothing was changed:$conflicts" >&2; exit 2; }
+# Windows refuses paths past 260 characters, and git then stops halfway through the docs commit.
+base=$(cd "$root" && pwd -W 2> /dev/null || pwd)
+cut -f1 "$tmp/keeping" | awk -v base="$base" 'length(base "/" $0) >= 250 { print; found = 1 } END { exit !found }' > "$tmp/long" && {
+	echo "$base is too deep for these paths, so nothing was changed:" >&2
+	cat "$tmp/long" >&2
+	exit 2
+}
+
+# Then act.
+[ -z "$inited" ] || git -C "$root" init -q
+while IFS="$(printf '\t')" read -r rel src; do
+	mkdir -p "$root/$(dirname "$rel")"
+	: > "$tmp/specs"
+	[ ! -s "$tmp/out-specs" ] || specs_for "$rel" > "$tmp/specs"
+	render "$latest" "$src" "$rel" "$tmp/specs" "$tmp/out" > "$root/$rel"
+done < "$tmp/keeping"
+
+hook=
+[ -z "$tracked$nohook" ] && grep -qx '.githooks/post-commit' "$tmp/out" || [ -n "$tracked$nohook" ] || hook=1
+if [ -n "$nohook" ] && [ -e "$root/.githooks/post-commit" ]; then
+	rm -f "$root/.githooks/post-commit"
+	rmdir "$root/.githooks" 2> /dev/null
+fi
+if [ -n "$hook" ]; then
+	chmod +x "$root/.githooks/post-commit"
+	git -C "$root" config core.hooksPath .githooks
+fi
+
+if [ -z "$tracked" ]; then
+	touch "$root/.gitignore"
+	# A project may ignore some of these already, so each is checked alone.
+	absent=
+	grep -Eqx '/?docs/?' "$root/.gitignore" || absent="$absent /docs/"
+	if [ -e "$root/AGENTS.md" ] && ! git -C "$root" ls-files --error-unmatch AGENTS.md > /dev/null 2>&1; then
+		grep -Eqx '/?AGENTS\.md' "$root/.gitignore" || absent="$absent /AGENTS.md"
+	fi
+	if [ -e "$root/CLAUDE.md" ] && ! git -C "$root" ls-files --error-unmatch CLAUDE.md > /dev/null 2>&1; then
+		grep -Eqx '/?CLAUDE\.md' "$root/.gitignore" || absent="$absent /CLAUDE.md"
+	fi
+	if [ -n "$absent" ]; then
+		[ -s "$root/.gitignore" ] && [ -n "$(tail -c 1 "$root/.gitignore")" ] && echo >> "$root/.gitignore"
+		echo '# Local working notes, kept out of this repository.' >> "$root/.gitignore"
+		for line in $absent; do
+			echo "$line" >> "$root/.gitignore"
+		done
+	fi
+fi
+if [ -n "$hook" ]; then
+	touch "$root/.gitattributes"
+	if ! grep -q '^\.githooks' "$root/.gitattributes"; then
+		[ -s "$root/.gitattributes" ] && [ -n "$(tail -c 1 "$root/.gitattributes")" ] && echo >> "$root/.gitattributes"
+		echo '.githooks/* text eol=lf' >> "$root/.gitattributes"
+	fi
+	# chmod isn't recorded on Windows, and a clone elsewhere would then skip the hook without a word.
+	git -C "$root" -c core.safecrlf=false add --chmod=+x -- .githooks/post-commit
+fi
+
+short=$(git -C "$here" rev-parse --short "$latest")
+if [ -z "$tracked" ]; then
+	git -C "$root/docs" init -q
+	git -C "$root/docs" add --all .
+	git -C "$root/docs" commit -q -m "Copy the documentation system from docskill $short" || exit 1
+fi
+# Left uncommitted on purpose: the first project commit after this pairs it through the hook.
+printf '%s\n' "$latest" > "$root/docs/.system-source"
+# A file it already had and keeps in place of the system's isn't a local change to report for good.
+while IFS= read -r rel; do
+	[ -n "$rel" ] && [ -e "$root/$rel" ] && printf '%s\n' "$rel" >> "$root/docs/.system-keep"
+done < "$tmp/out"
+
+# A link to what's out became plain text, but a name in plain text remains: say where.
+while IFS= read -r rel; do
+	case $rel in docs/*) ;; *) continue ;; esac
+	name=${rel##*/}
+	name=${name%.md}
+	grep -rlF --exclude-dir=.git -- "$name" "$root/docs" "$root/AGENTS.md" 2> /dev/null | while IFS= read -r where; do
+		echo "still names $name: ${where#"$root"/}"
+	done
+done < "$tmp/out"
+
+echo "copied $(wc -l < "$tmp/keeping") files from docskill $short into $root"
+if [ -n "$commit" ]; then
+	if [ -n "$tracked" ]; then
+		paths="docs"
+		[ -e "$root/AGENTS.md" ] && paths="$paths AGENTS.md"
+		[ -e "$root/CLAUDE.md" ] && paths="$paths CLAUDE.md"
+	else
+		paths=
+		[ -f "$root/.gitignore" ] && paths="$paths .gitignore"
+		[ -n "$hook" ] && paths="$paths .gitattributes .githooks/post-commit"
+	fi
+	while IFS= read -r rel; do
+		case $rel in
+		docs/* | AGENTS.md | CLAUDE.md | .githooks/*) ;;
+		*) paths="$paths $rel" ;;
+		esac
+	done <<EOF
+$(cut -f1 "$tmp/keeping")
+EOF
+	cd "$root" || exit 1
+	# shellcheck disable=SC2086
+	git -c core.safecrlf=false add -- $paths
+	[ -z "$hook" ] || git -c core.safecrlf=false add --chmod=+x -- .githooks/post-commit
+	git -c core.safecrlf=false commit -q -m "Set up the docs" || exit 1
+	if [ -n "$hook" ]; then
+		expected="$(git rev-parse --short HEAD):"
+		if git -C docs log -1 --format=%s | grep -q " $expected "; then
+			echo "the hook fired: $(git -C docs log -1 --format=%s)"
+		else
+			echo "the hook did not pair the docs: check core.hooksPath and .githooks/post-commit" >&2
+			exit 1
+		fi
+	fi
+else
+	if [ -n "$hook" ]; then
+		echo "nothing committed in the project; the next project commit pairs docs/.system-source through the hook"
+	else
+		echo "nothing committed in the project"
+	fi
+fi

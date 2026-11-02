@@ -1,0 +1,209 @@
+#!/bin/sh
+# check-docs: the mechanical checks of a project's docs. Only reads. This is a check of the docs,
+# not a test of the project. Exits 1 when a check fails; warnings alone exit 0.
+#   check-docs [project]
+export GIT_OPTIONAL_LOCKS=0
+root=$(cd "${1:-.}" 2>/dev/null && pwd) || { echo "no such folder: $1" >&2; exit 2; }
+docs=$root/docs
+[ -d "$docs" ] || { echo "no docs/ in $root" >&2; exit 2; }
+here=$(cd "$(dirname "$0")" && pwd)
+
+tmp=$(mktemp -d) || exit 2
+trap 'rm -rf "$tmp"' EXIT
+out=$tmp/report
+: > "$out"
+fail() { echo "FAIL  $*" >> "$out"; }
+warn() { echo "warn  $*" >> "$out"; }
+
+# Paths relative to docs/, one per line.
+(cd "$docs" && find . -name .git -prune -o -type f -print | sed 's|^\./||') | sort > "$tmp/all"
+grep '\.md$' "$tmp/all" > "$tmp/md"
+
+is_quote() {
+	case $1 in
+	user-quotes/order.md) return 1 ;;
+	user-quotes/* | */the-users-words-behind-these-rules/*) return 0 ;;
+	esac
+	return 1
+}
+
+# Frozen or open-sized by the system's own rules; the size, date and count checks skip them.
+is_living() {
+	case $1 in
+	reports/* | batons/* | user-quotes/* | */the-users-words-behind-these-rules/* | AUTHORITY.md | DOCUMENTATION_SYSTEM.md) return 1 ;;
+	esac
+	return 0
+}
+
+while IFS= read -r rel; do
+	is_living "$rel" && printf '%s\n' "$rel"
+done < "$tmp/md" > "$tmp/living"
+while IFS= read -r rel; do
+	is_quote "$rel" && printf '%s\n' "$rel"
+done < "$tmp/md" > "$tmp/quotes"
+
+# Runs a command over the docs files listed in a file, in as few processes as possible.
+over() { # over <list> <command...>
+	list=$1
+	shift
+	[ -s "$list" ] && (cd "$docs" && tr '\n' '\0' < "$list" | xargs -0 "$@")
+}
+
+# Whether this project keeps a rule of the system file. One left out isn't checked.
+keeps() { [ ! -f "$docs/DOCUMENTATION_SYSTEM.md" ] || grep -qF -- "$1" "$docs/DOCUMENTATION_SYSTEM.md"; }
+
+# A file a script writes says so near its top; the size, date and count checks skip it.
+over "$tmp/living" awk 'FNR <= 5 && /^<!-- Generated / && !(FILENAME in seen) { seen[FILENAME] = 1; print FILENAME }' | sort > "$tmp/generated"
+comm -23 "$tmp/living" "$tmp/generated" > "$tmp/written"
+
+# Relative links outside fences and inline code: "file<TAB>target".
+link_awk='
+	FNR == 1 { fenced = 0 }
+	/^(~~~|```)/ { fenced = !fenced; next }
+	fenced { next }
+	{
+		line = $0
+		gsub(/`[^`]*`/, "", line)
+		while (match(line, /\]\([^) ]+/)) {
+			print FILENAME "\t" substr(line, RSTART + 2, RLENGTH - 2)
+			line = substr(line, RSTART + RLENGTH)
+		}
+	}'
+over "$tmp/md" awk "$link_awk" > "$tmp/links"
+
+while IFS="$(printf '\t')" read -r rel link; do
+	case $link in
+	\#* | http:* | https:* | mailto:* | /* | [A-Za-z]:*) continue ;;
+	esac
+	target=${link%%#*}
+	case $target in
+	*%*) target=$(printf '%b' "$(printf '%s' "$target" | sed 's/%\([0-9A-Fa-f][0-9A-Fa-f]\)/\\x\1/g')") ;;
+	esac
+	case $rel in
+	*/*) dir=${rel%/*} ;;
+	*) dir=. ;;
+	esac
+	[ -e "$docs/$dir/$target" ] && continue
+	case $rel in
+	reports/*) warn "broken link in a frozen report: $rel -> $link" ;;
+	*) case $link in *%*) warn "can't check an encoded link: $rel -> $link"; continue ;; esac ;;
+	esac
+	case $rel in
+	reports/*) ;;
+	*) fail "broken link: $rel -> $link" ;;
+	esac
+done < "$tmp/links"
+
+# A number or date that numbers a name, at its start or end. One that states a fact inside a name is
+# fine, and a frozen report keeps the name it came with.
+if keeps '**No numbering**'; then
+	grep -E '(^|/)[0-9]+[-_. ]|-[0-9]+\.md$' "$tmp/all" | grep -v '^reports/' | while IFS= read -r rel; do
+		fail "numbered name: $rel"
+	done
+fi
+
+# Handoffs and batons have a fixed shape.
+grep '^handoff/' "$tmp/md" | while IFS= read -r rel; do
+	case $rel in
+	*-handoff.md) ;;
+	*) fail "a handoff's name must end in -handoff.md: $rel" ;;
+	esac
+done
+keeps '- **Baton**' && grep '^batons/' "$tmp/md" | while IFS= read -r rel; do
+	case ${rel##*/} in
+	continue-*-with-this-user-baton.md) ;;
+	*) fail "a baton's name must be continue-<what>-with-this-user-baton.md: $rel" ;;
+	esac
+	head -n 1 "$docs/$rel" | tr -d '\r' | grep -q '^# Baton:' || fail "a baton's title must start with Baton: $rel"
+	grep -q '^## First' "$docs/$rel" || fail "a baton must open with a ## First section: $rel"
+done
+
+# order.md lists exactly the quote files.
+grep '^user-quotes/' "$tmp/quotes" | sed 's|^user-quotes/||' | sort > "$tmp/quote-files"
+if [ -f "$docs/user-quotes/order.md" ]; then
+	awk "$link_awk" "$docs/user-quotes/order.md" | cut -f2 | sed 's|^\./||' | sort > "$tmp/ordered"
+	comm -23 "$tmp/quote-files" "$tmp/ordered" | while IFS= read -r name; do
+		fail "quote file not in order.md: user-quotes/$name"
+	done
+	comm -13 "$tmp/quote-files" "$tmp/ordered" | while IFS= read -r name; do
+		fail "order.md lists a file that is not there: $name"
+	done
+elif [ -s "$tmp/quote-files" ]; then
+	fail "quote files with no user-quotes/order.md"
+fi
+
+# Each quote has its fence and date. A group said one after another may share one date, so one Said on
+# line is enough, and where several people decide it may name them: Said by <name> on <date>.
+keeps '- **User quotes**' && while IFS= read -r rel; do
+	grep -q '^~~~text' "$docs/$rel" && grep -Eq '^Said (by .+ )?on [0-9]{4}-[0-9]{2}-[0-9]{2}' "$docs/$rel" \
+		|| fail "a quote needs a ~~~text fence and a Said on line: $rel"
+done < "$tmp/quotes"
+
+# No file holds a secret: a pasted value is as likely in a handoff or baton as in a quote.
+secret='(^|[^A-Za-z0-9])sk[-_](live_|test_)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|xox[abprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY|eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.|[a-z+]+://[^/ :@]+:[^/ :@]{3,}@'
+over "$tmp/md" grep -lE "$secret" | while IFS= read -r rel; do
+	fail "secret-shaped string: $rel"
+done
+
+# "About 40 lines" is an aim, so this warns only well past it.
+keeps '**Small.**' && over "$tmp/written" awk '
+	FNR == 1 && NR > 1 && lines > 50 { print lines "\t" name }
+	{ lines = FNR; name = FILENAME }
+	END { if (lines > 50) print lines "\t" name }' | while IFS="$(printf '\t')" read -r lines rel; do
+	warn "over about 40 lines ($lines): $rel"
+done
+
+base=$(cd "$docs" && pwd -W 2>/dev/null || pwd)
+awk -v base="$base" 'length(base "/" $0) >= 240 { print }' "$tmp/all" | while IFS= read -r rel; do
+	warn "path nears the Windows limit: $rel"
+done
+
+keeps '**No counts or dates' && over "$tmp/written" grep -lE '20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]|[0-9]+ (tests?|files|commits|handoffs|rules|batons|passing)\b' \
+	| while IFS= read -r rel; do
+		warn "a date or count in a living file: $rel"
+	done
+
+# The project side only applies where the project is its own git repository.
+if [ -z "$(git -C "$root" rev-parse --show-cdup 2>/dev/null)" ] && git -C "$root" rev-parse --git-dir > /dev/null 2>&1; then
+	if [ -f "$root/.githooks/post-commit" ]; then
+		hooks=$(git -C "$root" config core.hooksPath)
+		case $hooks in
+		.githooks) ;;
+		'') warn "core.hooksPath is unset, so the hook won't pair the docs" ;;
+		*) warn "core.hooksPath is $hooks, so the hook won't pair the docs" ;;
+		esac
+		case $(git -C "$root" ls-files -s .githooks/post-commit | cut -c1-6) in
+		100644) warn "the hook isn't executable in git, so a clone on Linux or macOS would skip it" ;;
+		esac
+	fi
+	# Docs tracked in the project are its choice. The checks below guard docs kept out of it.
+	if [ -z "$(git -C "$root" ls-files docs | head -n 1)" ]; then
+		for name in AGENTS.md CLAUDE.md; do
+			[ -e "$root/$name" ] || continue
+			git -C "$root" ls-files --error-unmatch "$name" > /dev/null 2>&1 && continue
+			git -C "$root" check-ignore -q "$name" || warn "$name is not git-ignored by the project"
+		done
+		if git -C "$root" check-ignore -q docs/; then
+			git -C "$root" grep -l -E '(^|[^/A-Za-z0-9_.-])docs/(rules|handoff|batons|plan|user-quotes|reports|project|architecture|AUTHORITY|DOCUMENTATION_SYSTEM|reading-order)' -- ':!.gitignore' 2>/dev/null 				| while IFS= read -r name; do
+					warn "tracked file names a private docs path: $name"
+				done
+		else
+			warn "docs/ is not git-ignored by the project"
+		fi
+	fi
+fi
+
+if [ -f "$docs/.system-source" ]; then
+	"$here/refresh" "$root" > "$tmp/refresh" 2>&1 || warn "refresh could not compare: $(head -n 1 "$tmp/refresh")"
+	grep '^local-change ' "$tmp/refresh" | while IFS= read -r line; do
+		warn "shared file changed locally: ${line#local-change }"
+	done
+else
+	warn "no docs/.system-source, so a refresh can't tell stale from changed"
+fi
+
+sort "$out"
+fails=$(grep -c '^FAIL' "$out")
+warns=$(grep -c '^warn' "$out")
+echo "$fails failed, $warns warnings, $(wc -l < "$tmp/md") md files"
+[ "$fails" -eq 0 ]
