@@ -54,3 +54,7 @@ worth knowing before you start:
 - Built and tried with Claude Code on Windows. The scripts are POSIX `sh`, but haven't been run on another platform.
 - Docs per package in a monorepo aren't supported: keep them at the root.
 - A very deep project folder can pass Windows' path limit. `bootstrap` refuses before changing anything.
+
+## License
+
+[MIT](LICENSE)
